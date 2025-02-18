@@ -1,47 +1,67 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
-import { FilmsRepository } from 'src/repository/films.repository';
-import { OrderDto } from './dto/order.dto';
+import { BadRequestException, Inject, Injectable } from '@nestjs/common';
+import { OrderDto, SessionDto } from './dto';
+import { FilmsRepositoryMongo } from 'src/repository/films-mongodb.repository';
+import { FilmsRepositoryPostgres } from 'src/repository/films-postgres.repository';
+import { AppConfig, EDriver } from 'src/app.config.provider';
+import { TResponse } from '../types';
 
 @Injectable()
 export class OrderService {
-  constructor(private readonly filmsRepository: FilmsRepository) {}
+  driver: EDriver;
+  constructor(
+    @Inject('CONFIG')
+    private readonly config: AppConfig,
+    private readonly filmsRepositoryMongo: FilmsRepositoryMongo,
+    private readonly filmsRepositoryPostgres: FilmsRepositoryPostgres,
+  ) {
+    this.driver = this.config.database.driver;
+  }
 
-  async makeOrder(order: OrderDto) {
+  async makeOrder(order: OrderDto): Promise<TResponse<SessionDto[]>> {
     const { tickets } = order;
 
     for (const ticket of tickets) {
       const { film, session, row, seat } = ticket;
+      let document;
+      const place = `${row}:${seat}`;
 
-      const seatIdentifier = `${row}:${seat}`;
-      const document = await this.filmsRepository.findFilm(film);
-      if (!document) {
-        throw new BadRequestException('Фильм не найден!');
+      switch (this.driver) {
+        case EDriver.mongodb:
+          document = await this.filmsRepositoryMongo.findFilmById(film);
+          break;
+        case EDriver.postgres:
+          document = await this.filmsRepositoryPostgres.findFilmById(film);
+          break;
       }
 
-      const currentSession = document?.schedule.find(
-        (item) => item.id === session,
-      );
-      if (!currentSession) {
-        throw new BadRequestException('Сеанс не найден!');
-      }
-      if (currentSession.taken.includes(seatIdentifier)) {
-        throw new BadRequestException('Выбранное место занято!');
+      const schedule = document.schedule.find((s) => s.id === session);
+      if (!schedule) throw new BadRequestException('Сеанс не найден');
+
+      const isTaken = Array.isArray(schedule.taken)
+        ? schedule.taken.includes(place)
+        : schedule.taken?.split(',').includes(place);
+
+      if (isTaken) throw new BadRequestException('Это место уже занято');
+
+      if (Array.isArray(schedule.taken)) {
+        schedule.taken.push(place);
+      } else {
+        schedule.taken = schedule.taken ? `${schedule.taken},${place}` : place;
       }
 
-      currentSession.taken.push(seatIdentifier);
-      try {
-        document.markModified('schedule');
-        await document.save();
-      } catch (error) {
-        throw new BadRequestException(
-          `Ошибка обновления расписания: ${error.message}`,
-        );
+      switch (this.driver) {
+        case EDriver.postgres:
+          await this.filmsRepositoryPostgres.save(document);
+          break;
+        case EDriver.mongodb:
+          await document.save();
+          break;
       }
     }
 
     return {
       total: tickets.length,
-      items: order.tickets,
+      items: order.tickets.map((ticket) => ({ ...ticket })),
     };
   }
 }
